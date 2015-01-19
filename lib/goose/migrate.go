@@ -95,6 +95,78 @@ func RunMigrations(conf *DBConf, migrationsDir string, target int64) (err error)
 	return nil
 }
 
+func RunPendingMigrations(conf *DBConf, migrationsDir string, target int64) (err error) {
+
+	db, err := OpenDBFromDBConf(conf)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	// must ensure that the version table exists if we're running on a pristine DB
+	if _, e := EnsureDBVersion(conf, db); e != nil {
+		log.Fatal(e)
+	}
+
+	migrations, err := CollectMigrations(migrationsDir, 0, target)
+	if err != nil {
+		return err
+	}
+
+	pendingMigrations := []*Migration{}
+
+	for _, m := range migrations {
+		if status := getMigrationStatus(db, m.Version, filepath.Base(m.Source)); status == "Pending" {
+			pendingMigrations = append(pendingMigrations, m)
+		}
+	}
+
+	if len(pendingMigrations) == 0 {
+		fmt.Printf("goose: no pending migrations found. current version: %d\n", target)
+		return nil
+	}
+
+	ms := migrationSorter(pendingMigrations)
+	ms.Sort(true)
+
+	fmt.Printf("goose: pending migrations found. db environment '%v', target: %d\n",
+		conf.Env, target)
+
+	for _, m := range ms {
+
+		switch filepath.Ext(m.Source) {
+		case ".go":
+			err = runGoMigration(conf, m.Source, m.Version, true)
+		case ".sql":
+			err = runSQLMigration(conf, db, m.Source, m.Version, true)
+		}
+
+		if err != nil {
+			return errors.New(fmt.Sprintf("FAIL %v, quitting migration", err))
+		}
+
+		fmt.Println("OK   ", filepath.Base(m.Source))
+	}
+
+	return nil
+}
+
+func getMigrationStatus(db *sql.DB, version int64, script string) string {
+	var row MigrationRecord
+	q := fmt.Sprintf("SELECT is_applied FROM goose_db_version WHERE version_id=%d ORDER BY tstamp DESC LIMIT 1", version)
+	e := db.QueryRow(q).Scan(&row.IsApplied)
+
+	if e != nil && e != sql.ErrNoRows {
+		log.Fatal(e)
+	}
+
+	if row.IsApplied {
+		return "Applied"
+	} else {
+		return "Pending"
+	}
+}
+
 // collect all the valid looking migration scripts in the
 // migrations folder, and key them by version
 func CollectMigrations(dirpath string, current, target int64) (m []*Migration, err error) {
